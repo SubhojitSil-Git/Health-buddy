@@ -5,8 +5,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 // ======================================================
 const SUPABASE_URL      = "https://vtckfnjdriltxqxqvduv.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_lJi0HkSGjhRSj0i4n0kn-g_uHtxnAjc";
-// Claude API is called through the Anthropic API proxy
-// (the browser-safe key is injected by the Anthropic platform)
+const HF_TOKEN          = "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"; // 👈 paste your hf_xxx token here
+const HF_MODEL          = "GRMenon/mental-health-mistral-7b-instructv0.2-finetuned-V2";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -231,8 +231,8 @@ chatForm.addEventListener("submit", async (e) => {
     chatHistory.push({ role: "assistant", content: response });
 
   } catch (err) {
-    console.error("Claude API error:", err);
-    response = "I'm having a bit of trouble connecting right now. But I'm still here — want to try again?";
+    console.error("HF API error:", err);
+    response = err.message.includes("warming up") ? err.message : "I'm having a bit of trouble connecting right now. But I'm still here — want to try again?";
     mood = detectMoodByKeywords(message);
   }
 
@@ -261,40 +261,73 @@ function unlock() {
 }
 
 // ======================================================
-// 7) CLAUDE API CALL
+// 7) HUGGING FACE MENTAL HEALTH MODEL CALL
 // ======================================================
 async function callClaudeAPI(history) {
-  const systemPrompt = `You are MindSpace AI Buddy — a warm, empathetic mental health companion. You are NOT a licensed therapist and should remind users to seek professional help for serious concerns.
+  // Build Mistral instruct-format prompt from conversation history
+  // Format: <s>[INST] ... [/INST] ... </s>[INST] ... [/INST]
+  let prompt = "<s>";
+  for (let i = 0; i < history.length; i++) {
+    const msg = history[i];
+    if (msg.role === "user") {
+      prompt += `[INST] ${msg.content} [/INST]`;
+    } else if (msg.role === "assistant") {
+      prompt += ` ${msg.content}</s>`;
+    }
+  }
+  // If last message was user, leave open for model to complete
+  if (history[history.length - 1]?.role === "user") {
+    // already open — model will generate after [/INST]
+  }
 
-Your role:
-- Listen actively and validate emotions without judgment
-- Ask one gentle follow-up question per response to encourage reflection
-- Offer simple coping strategies when appropriate (breathing, journaling, movement)
-- Keep responses conversational and human — 2-4 sentences usually, never a wall of text
-- Use gentle language. No toxic positivity. No lecturing.
-- If someone seems persistently distressed, gently suggest speaking to a professional or trusted person
-- You never pretend to have experiences or a body, but you can express care genuinely
+  const res = await fetch(
+    `https://api-inference.huggingface.co/models/${HF_MODEL}`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${HF_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: {
+          max_new_tokens: 300,
+          temperature: 0.75,
+          top_p: 0.92,
+          repetition_penalty: 1.15,
+          do_sample: true,
+          return_full_text: false,
+        },
+        options: {
+          wait_for_model: true, // waits if model is cold-starting (up to 60s)
+          use_cache: false,
+        },
+      }),
+    }
+  );
 
-Important: You are not a replacement for human connection or professional mental health care.`;
-
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: systemPrompt,
-      messages: history,
-    }),
-  });
+  // Model loading — HF returns 503 with estimated_time when cold
+  if (res.status === 503) {
+    const err = await res.json().catch(() => ({}));
+    const wait = err.estimated_time ? Math.ceil(err.estimated_time) : 30;
+    throw new Error(`Model is warming up, please wait ~${wait}s and try again.`);
+  }
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `API error ${res.status}`);
+    throw new Error(err.error || `HF API error ${res.status}`);
   }
 
   const data = await res.json();
-  return data.content?.[0]?.text || "I'm here. Can you tell me more?";
+
+  // HF text-generation returns array of {generated_text}
+  let text = data?.[0]?.generated_text || "";
+
+  // Strip any leftover prompt artifacts or [INST] tags
+  text = text.replace(/\[INST\].*?\[\/INST\]/gs, "").trim();
+  text = text.replace(/<s>|<\/s>/g, "").trim();
+
+  return text || "I'm here with you. Can you tell me a little more about how you're feeling?";
 }
 
 // ======================================================
