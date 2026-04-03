@@ -6,7 +6,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const SUPABASE_URL      = "https://vtckfnjdriltxqxqvduv.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_lJi0HkSGjhRSj0i4n0kn-g_uHtxnAjc";
 const HF_TOKEN          = "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"; // 👈 paste your hf_xxx token here
-const HF_MODEL          = "GRMenon/mental-health-mistral-7b-instructv0.2-finetuned-V2";
+const HF_MODEL          = "Amod/mental-health-therapy-mistral-7b-ins-SFT";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -263,72 +263,104 @@ function unlock() {
 // ======================================================
 // 7) HUGGING FACE MENTAL HEALTH MODEL CALL
 // ======================================================
-async function callClaudeAPI(history) {
-  // Build Mistral instruct-format prompt from conversation history
-  // Format: <s>[INST] ... [/INST] ... </s>[INST] ... [/INST]
+
+// Build Mistral instruct prompt — last 6 turns max
+function buildPrompt(history) {
+  const recent = history.slice(-6);
   let prompt = "<s>";
-  for (let i = 0; i < history.length; i++) {
-    const msg = history[i];
+  for (const msg of recent) {
     if (msg.role === "user") {
-      prompt += `[INST] ${msg.content} [/INST]`;
+      prompt += "[INST] " + msg.content + " [/INST]";
     } else if (msg.role === "assistant") {
-      prompt += ` ${msg.content}</s>`;
+      prompt += " " + msg.content + " </s>";
     }
   }
-  // If last message was user, leave open for model to complete
-  if (history[history.length - 1]?.role === "user") {
-    // already open — model will generate after [/INST]
+  return prompt;
+}
+
+// Strip prompt echoes, tags, repeated user message from output
+function cleanOutput(raw, lastUserMsg) {
+  let text = (raw || "");
+  text = text.replace(/\[INST\][\s\S]*?\[\/INST\]/g, "");
+  text = text.replace(/<\/?s>/g, "");
+  if (lastUserMsg) {
+    const escaped = lastUserMsg.replace(/[.*+?^${}()|[\]\]/g, "\$&");
+    text = text.replace(new RegExp(escaped, "gi"), "");
+  }
+  text = text.replace(/
+{3,}/g, "
+
+").trim();
+  return text;
+}
+
+async function callClaudeAPI(history) {
+  const prompt = buildPrompt(history);
+  const lastUserMsg = [...history].reverse().find(m => m.role === "user")?.content || "";
+
+  let res;
+  try {
+    res = await fetch(
+      "https://api-inference.huggingface.co/models/" + HF_MODEL,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + HF_TOKEN,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          inputs: prompt,
+          parameters: {
+            max_new_tokens: 250,
+            temperature: 0.7,
+            top_p: 0.9,
+            repetition_penalty: 1.2,
+            do_sample: true,
+            return_full_text: false,
+          },
+          options: {
+            wait_for_model: true,
+            use_cache: false,
+          },
+        }),
+      }
+    );
+  } catch (networkErr) {
+    throw new Error("Network error — check your connection and try again.");
   }
 
-  const res = await fetch(
-    `https://api-inference.huggingface.co/models/${HF_MODEL}`,
-    {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${HF_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        inputs: prompt,
-        parameters: {
-          max_new_tokens: 300,
-          temperature: 0.75,
-          top_p: 0.92,
-          repetition_penalty: 1.15,
-          do_sample: true,
-          return_full_text: false,
-        },
-        options: {
-          wait_for_model: true, // waits if model is cold-starting (up to 60s)
-          use_cache: false,
-        },
-      }),
-    }
-  );
-
-  // Model loading — HF returns 503 with estimated_time when cold
+  // 503 = model cold starting, tell user to wait
   if (res.status === 503) {
-    const err = await res.json().catch(() => ({}));
-    const wait = err.estimated_time ? Math.ceil(err.estimated_time) : 30;
-    throw new Error(`Model is warming up, please wait ~${wait}s and try again.`);
+    const body = await res.json().catch(() => ({}));
+    const secs = body.estimated_time ? Math.ceil(body.estimated_time) : 40;
+    throw new Error("The AI is warming up (~" + secs + "s). Please wait a moment and resend your message.");
+  }
+
+  if (res.status === 401 || res.status === 403) {
+    throw new Error("HF token is invalid or expired — please update it.");
   }
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `HF API error ${res.status}`);
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Model error (" + res.status + "). Please try again.");
   }
 
   const data = await res.json();
 
-  // HF text-generation returns array of {generated_text}
-  let text = data?.[0]?.generated_text || "";
+  let raw = "";
+  if (Array.isArray(data)) {
+    raw = data[0]?.generated_text || "";
+  } else if (data && typeof data === "object") {
+    raw = data.generated_text || "";
+  }
 
-  // Strip any leftover prompt artifacts or [INST] tags
-  text = text.replace(/\[INST\].*?\[\/INST\]/gs, "").trim();
-  text = text.replace(/<s>|<\/s>/g, "").trim();
-
-  return text || "I'm here with you. Can you tell me a little more about how you're feeling?";
+  const cleaned = cleanOutput(raw, lastUserMsg);
+  if (!cleaned || cleaned.length < 5) {
+    return "I hear you. Can you tell me a little more about what's been on your mind?";
+  }
+  return cleaned;
 }
+
 
 // ======================================================
 // 8) DETECTION HELPERS
